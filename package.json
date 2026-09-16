@@ -1,0 +1,15 @@
+{
+  "name": "mercadopublico-mcp",
+  "version": "1.0.0",
+  "description": "Servidor MCP propio sobre la API pública de Mercado Público (ChileCompra), para consultar licitaciones, órdenes de compra y proveedores directamente desde el chat de Claude.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "express": "^4.21.0",
+    "zod": "^3.23.8"
+  }
+}
