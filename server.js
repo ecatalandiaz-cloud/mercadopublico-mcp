@@ -77,6 +77,53 @@ function extraerSeccion(textoPlano, etiquetaInicio, etiquetaFin) {
   return (fin === -1 ? desdeInicio : desdeInicio.slice(0, fin)).trim();
 }
 
+// Extrae los nombres exactos de los anexos pedidos en "4. Antecedentes para incluir en la oferta",
+// separados por categoría (Administrativos / Técnicos / Económicos) — funciona tanto si las bases
+// vienen incrustadas como si no, porque los NOMBRES de los anexos siempre aparecen ahí como texto,
+// aunque el archivo en sí no esté disponible para descargar automáticamente. Esto es lo que permite
+// convertir un genérico "ve y revisa la ficha" en una lista concreta de qué buscar y descargar.
+function extraerAnexosRequeridos(texto) {
+  const seccion4 = extraerSeccion(texto, "Antecedentes para incluir en la oferta", "Requisitos para contratar al proveedor adjudicado");
+  if (!seccion4) return null;
+
+  function limpiarCola(item) {
+    // Quita un número de sección que se haya colado al final del último ítem
+    // (ej: "...OFERTA ECONÓMICA 5." donde el "5." es el inicio de la sección siguiente).
+    return item.replace(/\s+\d+\.\s*$/, "").trim();
+  }
+
+  function itemsDeCategoria(bloque) {
+    if (!bloque) return [];
+    const items = [];
+    const regex = /\d+\.-\s*(.+?)(?=(?:\d+\.-)|$)/g;
+    let m;
+    while ((m = regex.exec(bloque)) !== null) {
+      const item = limpiarCola(m[1].trim());
+      if (item) items.push(item);
+    }
+    return items;
+  }
+
+  const admin = extraerSeccion(seccion4, "Documentos Administrativos", "Documentos Técnicos");
+  const tecnicos = extraerSeccion(seccion4, "Documentos Técnicos", "Documentos Económicos");
+  const economicos = extraerSeccion(seccion4, "Documentos Económicos", null);
+
+  // Algunas licitaciones no piden ningún archivo — el anexo se llena directo en el portal, y esto
+  // se indica con la frase "A TRAVÉS DE ESTE MEDIO" en vez de un nombre de anexo real. Esos ítems
+  // no cuentan como "requiere archivo", aunque numéricamente aparezcan como un ítem más.
+  const patronSinArchivo = /^A\s*TRAV[EÉ]S\s*DE\s*ESTE\s*MEDIO/i;
+
+  const resultado = {
+    administrativos: itemsDeCategoria(admin),
+    tecnicos: itemsDeCategoria(tecnicos),
+    economicos: itemsDeCategoria(economicos)
+  };
+  const todos = [...resultado.administrativos, ...resultado.tecnicos, ...resultado.economicos];
+  resultado.totalAnexos = todos.length;
+  resultado.requiereArchivo = todos.some(t => !patronSinArchivo.test(t));
+  return resultado;
+}
+
 function extraerFichaCompleta(html) {
   const texto = extraerTextoPlano(html);
   const codigoMatch = texto.match(/Licitaci[oó]n ID:\s*([A-Za-z0-9\-]+)/);
@@ -87,6 +134,7 @@ function extraerFichaCompleta(html) {
     basesAdministrativas: basesAdmin,
     basesTecnicas: basesTec,
     tieneBasesIncrustadas: !!(basesAdmin || basesTec),
+    anexosRequeridos: extraerAnexosRequeridos(texto),
     textoCompleto: texto
   };
 }
@@ -209,7 +257,7 @@ server.registerTool(
   "obtener_ficha_completa",
   {
     title: "Obtener ficha completa de una licitación (incluye bases si están incrustadas)",
-    description: "Trae la ficha web pública de una licitación (no la API estructurada) y busca si el organismo incrustó el texto completo de las Bases Administrativas y Técnicas directamente en la página. Cuando sí vienen incrustadas, las devuelve completas, listas para analizar. Cuando no (algunos organismos solo referencian archivos PDF separados para descargar), lo indica explícitamente — en ese caso, pide a la persona que descargue esos anexos desde la ficha y los suba directo al chat para analizarlos.",
+    description: "Trae la ficha web pública de una licitación (no la API estructurada) y busca si el organismo incrustó el texto completo de las Bases Administrativas y Técnicas directamente en la página. Cuando sí vienen incrustadas, las devuelve completas, listas para analizar. Patrón observado probando varios casos reales (muestra pequeña, no una regla garantizada): organismos centrales/ministeriales grandes (ej. MOP, SEGPRES) tienden a incrustar las bases completas; municipalidades y licitaciones más chicas tienden a usar archivos PDF separados, o incluso a no requerir ningún archivo (\"a través de este medio\", llenado directo en el portal). Cuando no vienen incrustadas, en vez de un genérico \"ve y revisa\", arma un checklist con los nombres exactos de cada anexo pedido (administrativos, técnicos, económicos) para que la persona sepa precisamente qué buscar y descargar, y lo suba directo al chat para analizarlo.",
     inputSchema: { codigo: z.string().describe("Código exacto de la licitación, ej: 1459-19-LE26") }
   },
   async ({ codigo }) => {
@@ -220,8 +268,25 @@ server.registerTool(
     }
     const html = await res.text();
     const datos = extraerFichaCompleta(html);
+    const urlFicha = `https://www.mercadopublico.cl/Procurement/Modules/RFB/DetailsAcquisition.aspx?idlicitacion=${encodeURIComponent(codigo)}`;
+
     if (!datos.tieneBasesIncrustadas) {
-      return { content: [{ type: "text", text: `Esta licitación (${codigo}) no trae las bases incrustadas en la ficha web — este organismo usa archivos PDF separados. Pide a la persona que los descargue desde https://www.mercadopublico.cl/Procurement/Modules/RFB/DetailsAcquisition.aspx?idlicitacion=${encodeURIComponent(codigo)} (sección "Antecedentes para incluir en la oferta") y los suba directo al chat para analizarlos.` }] };
+      const anexos = datos.anexosRequeridos;
+
+      // Caso 1: no se detectó ningún anexo con archivo (probable "a través de este medio" — no hay nada que descargar)
+      if (!anexos || !anexos.requiereArchivo) {
+        return { content: [{ type: "text", text: `Esta licitación (${codigo}) no trae bases incrustadas, pero tampoco parece pedir ningún archivo adjunto — es probable que sea de las que se llenan directo en el portal ("a través de este medio"). Puedes confirmarlo entrando a ${urlFicha} y revisando la sección "Antecedentes para incluir en la oferta". Si de todas formas hay anexos para descargar, súbelos aquí y los reviso.` }] };
+      }
+
+      // Caso 2: sí hay anexos con nombre — arma el checklist exacto, no un "ve y revisa" genérico
+      const listaConNumeros = (items) => items.map((t, i) => `   ${i + 1}. ${t}`).join("\n");
+      let checklist = `Esta licitación (${codigo}) pide ${anexos.totalAnexos} anexo${anexos.totalAnexos === 1 ? "" : "s"}, pero el organismo no los incrustó en la ficha — hay que descargarlos a mano. Esto es exactamente lo que hay que buscar y subir aquí, uno por uno o todos juntos:\n\n`;
+      if (anexos.administrativos.length) checklist += `📋 Documentos administrativos:\n${listaConNumeros(anexos.administrativos)}\n\n`;
+      if (anexos.tecnicos.length) checklist += `🔧 Documentos técnicos:\n${listaConNumeros(anexos.tecnicos)}\n\n`;
+      if (anexos.economicos.length) checklist += `💰 Documentos económicos:\n${listaConNumeros(anexos.economicos)}\n\n`;
+      checklist += `Para descargarlos: entra a ${urlFicha}, baja hasta "4. Antecedentes para incluir en la oferta", y busca estos mismos nombres — cada uno tiene un enlace o ícono de descarga al lado. Súbelos aquí apenas los tengas y los analizo.`;
+
+      return { content: [{ type: "text", text: checklist }] };
     }
     return { content: [{ type: "text", text: JSON.stringify(datos, null, 2) }] };
   }
